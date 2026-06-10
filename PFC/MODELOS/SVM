@@ -1,0 +1,206 @@
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC
+from sklearn.metrics import classification_report, confusion_matrix
+import joblib
+from sklearn.svm import SVC
+import time
+
+
+
+# =========================
+# 1) Feature extraction
+# =========================
+def extract_features(x: np.ndarray) -> dict:
+    x = np.asarray(x, dtype=np.float64)
+    if x.size < 3:
+        return {
+            "n": int(x.size),
+            "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0,
+            "abs_mean": 0.0, "abs_max": 0.0,
+            "skew": 0.0, "kurt": 0.0,
+            "dx_abs_mean": 0.0, "dx_abs_max": 0.0,
+            "zcr_median": 0.0,
+        }
+
+    mean = float(np.mean(x))
+    std = float(np.std(x, ddof=1)) if x.size > 1 else 0.0
+    xmin = float(np.min(x))
+    xmax = float(np.max(x))
+    ptp = float(xmax - xmin)
+
+    abs_mean = float(np.mean(np.abs(x)))
+    abs_max = float(np.max(np.abs(x)))
+
+    s = pd.Series(x)
+    skew = float(s.skew()) if x.size >= 3 else 0.0
+    kurt = float(s.kurt()) if x.size >= 4 else 0.0
+
+    dx = np.diff(x)
+    dx_abs_max = float(np.max(np.abs(dx)))
+
+    med = np.median(x)
+    signs = np.sign(x - med)
+    signs[signs == 0] = 1
+    zc = np.sum(signs[1:] != signs[:-1])
+    zcr_median = float(zc) / float(x.size - 1)
+
+    return {
+        "mean": mean,  
+        "min": xmin, 
+        "ptp": ptp,
+        "skew": skew, 
+        "kurt": kurt,
+        "dx_abs_max": dx_abs_max,
+        "zcr_median": zcr_median
+    }
+
+
+# =========================
+# 2) Load CSV
+# =========================
+
+dataset = "dataset_juntos.csv"
+df = pd.read_csv(dataset)
+
+rows = []
+for win_id, g in df.groupby("janela", sort=False):
+    x = g["sinal_filtrado"].to_numpy()
+    feats = extract_features(x)
+
+    # label da janela: maioria (mode)
+    y_win = int(g["classificacao"].mode().iloc[0]) if len(g) else 0
+    # alternativa que às vezes aumenta recall de piscada:
+    #y_win = int(g["class_bin"].max())
+
+    feats["janela"] = win_id
+    feats["y"] = y_win
+    rows.append(feats)
+
+feat_df = pd.DataFrame(rows)
+
+y = feat_df["y"].astype(int)
+X = feat_df.drop(columns=["y", "janela"])
+
+import matplotlib.pyplot as plt
+
+X_plot = X.rename(columns={
+    "mean": "Média",
+    "min": "Mínimo",
+    "ptp": "Amplitude pico a pico",
+    "skew": "Assimetria",
+    "kurt": "Curtose",
+    "dx_abs_max": "Máx. diferença absoluta",
+    "zcr_median": "Taxa de cruzamentos da mediana"
+})
+
+corr = X_plot.corr(method="pearson")   # também pode usar method="spearman"
+
+plt.figure(figsize=(8, 6))
+im = plt.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
+plt.colorbar(im, label="Correlação")
+
+plt.xticks(range(len(corr.columns)), corr.columns, rotation=45, ha="right")
+plt.yticks(range(len(corr.index)), corr.index)
+
+# escrever os valores dentro da matriz
+for i in range(len(corr.index)):
+    for j in range(len(corr.columns)):
+        plt.text(j, i, f"{corr.iloc[i, j]:.2f}", ha="center", va="center", fontsize=9)
+
+#plt.title("Matriz de correlação entre as características extraídas")
+plt.tight_layout()
+plt.show()
+
+print("Amostras (janelas):", len(feat_df))
+print("Distribuição classes:\n", y.value_counts(normalize=True).rename("proporção"))
+
+
+# =========================
+# 3) Train/test split + SVM (LinearSVC leve)
+# =========================
+#for seed in range(10):
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.25,
+    random_state=42,
+    stratify=y if y.nunique() > 1 else None
+)
+
+# svm_model = Pipeline(steps=[
+#     ("scaler", StandardScaler()),
+#     ("clf", LinearSVC(
+#         class_weight="balanced",
+#         random_state=42,
+#         C=1.0
+#     ))
+# ])
+
+svm_model = Pipeline(steps=[
+    ("scaler", StandardScaler()),
+    ("clf", SVC(
+        kernel="rbf",            # Fronteira curva, essencial para sinais complexos
+        C=20,                  # Permite um ajuste um pouco mais firme aos padrões da piscada
+        gamma="scale",           # Deixa o modelo calcular automaticamente o raio de influência
+        class_weight="balanced", # Compensa o fato de que a maioria do sinal não é piscada dupla
+        random_state=42
+    ))
+])
+
+svm_model.fit(X_train, y_train)
+
+
+# =========================
+# 4) Evaluate
+# =========================
+y_pred = svm_model.predict(X_test)
+
+labels = [0, 1]
+label_names = ["nao_piscada", "piscada"]
+
+cm = confusion_matrix(y_test, y_pred, labels=labels)
+cm_df = pd.DataFrame(cm, index=label_names, columns=label_names)
+print("\nMatriz de confusão (linhas=real, colunas=predito):\n")
+print(cm_df)
+
+print("\nClassification report:\n", classification_report(y_test, y_pred, digits=4))
+    
+
+    # Cria um "sinal EOG" aleatório apenas para testar a velocidade
+# df = pd.read_csv("dataset_teste.csv")
+
+# janela_teste = df["sinal_filtrado"].to_numpy(dtype=np.float32)  # (500,)
+
+# feats = extract_features(janela_teste)
+# janela_teste = pd.DataFrame([feats]) 
+
+# # Aquecimento (a primeira predição no TensorFlow sempre é mais lenta)
+# _ = svm_model.predict(janela_teste)
+
+# # Cronometrando 100 inferências em tempo real
+# tempos = []
+# for _ in range(100):
+#     inicio = time.time()
+#     _ = svm_model.predict(janela_teste)
+#     fim = time.time()
+#     tempos.append(fim - inicio)
+
+# tempo_medio_ms = np.mean(tempos) * 1000
+# print(f"Tempo médio de inferência por janela: {tempo_medio_ms:.2f} milissegundos")
+
+
+# =========================
+# 5) Save model + feature list
+# =========================
+artifact = {
+    "model": svm_model,
+    "feature_columns": list(X.columns)
+}
+
+#joblib.dump(artifact, "svm_linear_piscada_eog.joblib")
+#print("\nModelo salvo em: svm_linear_piscada_eog.joblib")

@@ -1,0 +1,186 @@
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+import joblib
+
+
+# =========================
+# 1) Feature extraction
+# =========================
+def extract_features(x: np.ndarray) -> dict:
+    """
+    Extrai features simples de uma janela de EOG.
+    x: array 1D com amostras do sinal EOG na janela.
+    """
+    x = np.asarray(x, dtype=np.float64)
+
+    mean = float(np.mean(x))
+    xmin = float(np.min(x))
+    xmax = float(np.max(x))
+    ptp = float(xmax - xmin)
+
+    # skew/kurt via pandas (evita depender de scipy)
+    s = pd.Series(x)
+    skew = float(s.skew()) if x.size >= 3 else 0.0
+    kurt = float(s.kurt()) if x.size >= 4 else 0.0
+
+    # Derivada discreta
+    dx = np.diff(x)
+    dx_abs_max = float(np.max(np.abs(dx)))
+
+    # Zero-crossing rate em torno da mediana (robusto a baseline)
+    med = np.median(x)
+    signs = np.sign(x - med)
+    signs[signs == 0] = 1
+    zc = np.sum(signs[1:] != signs[:-1])
+    zcr_median = float(zc) / float(x.size - 1)
+
+    return {
+        "mean": mean,  
+        "min": xmin, 
+        "ptp": ptp,
+        "skew": skew, 
+        "kurt": kurt,
+        "dx_abs_max": dx_abs_max,
+        "zcr_median": zcr_median
+    }
+
+
+# =========================
+# 2) Load CSV 
+# =========================
+
+dataset = "dataset_juntos.csv"  
+df = pd.read_csv(dataset)
+
+# Agrupa por janela: extrai features do sinal e define label pela moda
+rows = []
+for win_id, g in df.groupby("janela", sort=False):
+    x = g["sinal_filtrado"].to_numpy()
+    feats = extract_features(x)
+
+    # label da janela: moda (maioria) de class_bin
+    y = int(g["classificacao"].mode().iloc[0]) if len(g) else 0
+
+    feats["janela"] = win_id
+    feats["y"] = y
+    rows.append(feats)
+
+feat_df = pd.DataFrame(rows)
+
+
+
+# Features e alvo
+y = feat_df["y"].astype(int)
+X = feat_df.drop(columns=["y", "janela"])
+
+# import matplotlib.pyplot as plt
+
+# # matriz de correlação
+# corr = X.corr()
+
+# plt.figure(figsize=(10, 8))
+# im = plt.imshow(corr, interpolation="nearest", aspect="auto")
+# plt.colorbar(im)
+
+# plt.xticks(range(len(corr.columns)), corr.columns, rotation=45, ha="right")
+# plt.yticks(range(len(corr.index)), corr.index)
+
+# plt.title("Matriz de Correlação das Features")
+# plt.tight_layout()
+# plt.show()
+
+# corr_com_y = feat_df.corr(numeric_only=True)["y"].drop("y").sort_values(key=abs, ascending=False)
+# print(corr_com_y)
+
+print("Amostras (janelas):", len(feat_df))
+print("Distribuição classes:\n", y.value_counts(normalize=True).rename("proporção"))
+
+
+# =========================
+# 3) Train/test split + Random Forest
+# =========================
+
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.25,
+    random_state=42,
+    stratify=y if y.nunique() > 1 else None
+)
+
+rf = RandomForestClassifier(
+    n_estimators=50,
+    random_state=42,
+    n_jobs=-1,
+    class_weight="balanced_subsample",  # ajuda se piscada for rara
+    min_samples_leaf=5,
+    min_samples_split=10,
+    max_depth=10
+)
+
+rf.fit(X_train, y_train)
+
+    # =========================
+    # 4) Evaluate
+    # =========================
+y_prob = rf.predict_proba(X_test)[:, 1]
+y_pred = (y_prob >= 0.8).astype(int)
+
+labels = [0, 1]
+label_names = ["nao_piscada", "piscada"]
+
+cm = confusion_matrix(y_test, y_pred, labels=labels)
+
+cm_df = pd.DataFrame(cm, index=label_names, columns=label_names)
+print("\nMatriz de confusão (linhas=real, colunas=predito):\n")
+print(cm_df)
+
+#print("\nConfusion matrix:\n", confusion_matrix(y_test, y_pred))
+print("\nClassification report:\n", classification_report(y_test, y_pred, digits=4))
+
+# AUC (se tiver as duas classes no teste)
+if y_test.nunique() == 2:
+    y_proba = rf.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, y_proba)
+    print(f"AUC: {auc:.4f}")
+
+
+import time
+
+# Cria o modelo (assumindo uma janela de 250 pontos)
+
+# Cria um "sinal EOG" aleatório apenas para testar a velocidade
+# df = pd.read_csv("dataset_teste.csv")
+
+# janela_teste = df["sinal_filtrado"].to_numpy(dtype=np.float32)  # (500,)
+
+# feats = extract_features(janela_teste)
+# janela_teste = pd.DataFrame([feats]) 
+
+# # Aquecimento (a primeira predição no TensorFlow sempre é mais lenta)
+# _ = rf.predict_proba(janela_teste)
+
+# # Cronometrando 100 inferências em tempo real
+# tempos = []
+# for _ in range(100):
+#     inicio = time.time()
+#     _ = rf.predict_proba(janela_teste)
+#     fim = time.time()
+#     tempos.append(fim - inicio)
+
+# tempo_medio_ms = np.mean(tempos) * 1000
+# print(f"Tempo médio de inferência por janela: {tempo_medio_ms:.2f} milissegundos")
+
+# =========================
+# 5) Save model + feature list
+# =========================
+artifact = {
+    "model": rf,
+    "feature_columns": list(X.columns)
+}
+#joblib.dump(artifact, "rf_piscada_eog.joblib")
+#print("\nModelo salvo em: rf_piscada_eog.joblib")
